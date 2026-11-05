@@ -1,0 +1,12 @@
+monai-physio-slicer
+Copyright 2026 monai-physio-slicer contributors
+
+Original extension code is licensed under Apache License 2.0 (LICENSE.txt).
+
+The CMake scaffolding is a modified adaptation of the Default extension and
+Scripted module templates in Slicer/Slicer, Utilities/Templates, consulted
+2026-10-06. The applicable 3D Slicer license is retained in LICENSES/Slicer.txt.
+These adapted files are not the unmodified Slicer templates.
+
+MONAI-Physio is an external dependency. This repository calls its public
+ConvertVTKToUSD API and does not redistribute the MONAI-Physio converter.

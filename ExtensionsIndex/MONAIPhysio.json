@@ -1,0 +1,11 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Slicer/Slicer/main/Schemas/slicer-extension-catalog-entry-schema-v1.0.2.json#",
+  "category": "Simulation",
+  "scm_type": "git",
+  "scm_url": "https://github.com/Project-MONAI/monai-physio-slicer.git",
+  "scm_revision": "main",
+  "build_dependencies": [],
+  "build_subdirectory": ".",
+  "enabled": true,
+  "tier": 1
+}
