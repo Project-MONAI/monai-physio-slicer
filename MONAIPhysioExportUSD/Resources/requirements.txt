@@ -1,0 +1,2 @@
+# Installed into Slicer's Python only after explicit user confirmation.
+monai-physio>=2026.11.1
