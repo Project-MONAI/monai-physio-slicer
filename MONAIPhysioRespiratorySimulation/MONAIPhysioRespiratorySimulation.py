@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Scripted 3D Slicer module simulating respiratory lung motion from one CT."""
+"""Scripted 3D Slicer module simulating respiratory lung motion or cardiac
+heart motion from one CT."""
 
 from __future__ import annotations
 
@@ -55,8 +56,53 @@ def register_sample_data() -> None:
 
 SETTINGS ="MONAIPhysio/respiratorySimulation/"
 DEFAULT_FOLDER = Path.home() / "MONAIPhysioRespiratorySimulation"
-# Slicer's GenericAnatomyColors lung color, if the color table is unavailable.
+# Slicer's GenericAnatomyColors lung and heart colors, if the color table is
+# unavailable.
 LUNG_COLOR = (197 / 255, 165 / 255, 145 / 255)
+HEART_COLOR = (206 / 255, 110 / 255, 84 / 255)
+
+# What differs between the two simulations. "rate_setting" keeps the
+# respiratory rate under its original settings key.
+SIMULATIONS: dict[str, dict[str, Any]] = {
+    "respiratory": {
+        "label": "Respiratory (lungs)",
+        "worker": "respiratory_simulation_worker.py",
+        "weights": "physicsnemo_mgn_lung_motion",
+        "network": "lung-motion",
+        "color_name": "left_lung",
+        "color": LUNG_COLOR,
+        "default_rate": 12.0,
+        "rate_setting": "cyclesPerMinute",
+        "rate_label": "Breaths per minute",
+        "surfaces": "Lung surfaces",
+        "images": "Lung 4D-CT",
+        "browser": "Respiratory motion",
+        "stage": "respiratory stage",
+        "usd_suffix": "respiration",
+        "organ": "lung",
+    },
+    "cardiac": {
+        "label": "Cardiac (heart)",
+        "worker": "cardiac_simulation_worker.py",
+        "weights": "physicsnemo_mgn_duke_heart_motion",
+        "network": "heart-motion",
+        "color_name": "heart",
+        "color": HEART_COLOR,
+        "default_rate": 60.0,
+        "rate_setting": "cardiacCyclesPerMinute",
+        "rate_label": "Beats per minute",
+        "surfaces": "Heart surfaces",
+        "images": "Heart 4D-CT",
+        "browser": "Cardiac motion",
+        "stage": "cardiac stage",
+        "usd_suffix": "heartbeat",
+        "organ": "heart",
+    },
+}
+HEART_SEGMENTERS = (
+    ("simpleware", "Simpleware Medical ASCardio (trained on)"),
+    ("nvsegment", "NV-Segment-CTMR (approximate)"),
+)
 
 
 class MONAIPhysioRespiratorySimulation(ScriptedLoadableModule):
@@ -64,7 +110,7 @@ class MONAIPhysioRespiratorySimulation(ScriptedLoadableModule):
 
     def __init__(self, parent: Any) -> None:
         super().__init__(parent)
-        parent.title = "MONAI-Physio Respiratory Simulation"
+        parent.title = "MONAI-Physio Respiratory and Cardiac Simulation"
         parent.categories = ["Simulation"]
         parent.contributors = ["Stephen Aylward"]
         parent.dependencies = []
@@ -73,22 +119,31 @@ class MONAIPhysioRespiratorySimulation(ScriptedLoadableModule):
             / "Resources/Icons/MONAIPhysioRespiratorySimulation.png"
         ))
         parent.helpText = (
-            "Simulates respiratory lung motion for a chest CT loaded in Slicer, "
-            "following MONAI-Physio tutorial 0: segments the lung lobes with "
-            "NV-Segment-CTMR (the segmenter the models were built from; needs a "
-            "CUDA GPU), fits a lung shape model and predicts a respiratory cycle "
-            "with a pretrained network. Writes the lung surfaces (VTP/) and optionally a warped "
-            "4D-CT (CT/) and an animated USD to one output folder; results "
-            "load as Slicer sequences.\n\n"
+            "Simulates respiratory lung motion or cardiac heart motion for a "
+            "chest CT loaded in Slicer, following MONAI-Physio's tutorial 0 "
+            "notebooks. Respiratory: segments the lung lobes with "
+            "NV-Segment-CTMR (needs a CUDA GPU), fits a lung shape model and "
+            "predicts a breathing cycle with a pretrained network. Cardiac: "
+            "segments the heart with Simpleware Medical ASCardio (a separate "
+            "commercial install, the segmenter the heart model was built from) "
+            "or, approximately, with NV-Segment-CTMR, fits the Duke heart shape "
+            "model and predicts a heartbeat with a pretrained network. Writes "
+            "the surfaces (VTP/) and optionally a warped 4D-CT (CT/) and an "
+            "animated USD to one output folder; results load as Slicer "
+            "sequences.\n\n"
             "Requirements: a CUDA GPU supported by the installed PyTorch, "
-            "with 16 GB or more of memory (about 15 GB used in testing).\n\n"
+            "with 16 GB or more of memory (about 15 GB used in testing), and "
+            "about 40 GB of free system memory (RAM plus page file) for a "
+            "512x512 chest CT: the lung shape-model fit peaked at 37 GB and "
+            "the cardiac simulation at 24 GB in testing.\n\n"
             "Downloads: 'Set up MONAI-Physio in Slicer...' asks first, then "
             "installs PyTorch, torch-scatter and MONAI-Physio into Slicer's "
-            "Python (several GB). The first run also downloads the pretrained "
-            "networks (about 0.5 GB, into ~/.monai_physio/network_weights, "
-            "after asking) and NV-Segment-CTMR (about 870 MB, from Hugging "
-            "Face), so it is much slower than later runs. 'Download sample' "
-            "fetches an 89 MB chest CT. Nothing else is downloaded or sent."
+            "Python (several GB). The first run of each simulation also "
+            "downloads its pretrained network (into "
+            "~/.monai_physio/network_weights, after asking), and NV-Segment-CTMR "
+            "(about 870 MB, from Hugging Face) when it is used, so it is much "
+            "slower than later runs. 'Download sample' fetches an 89 MB chest "
+            "CT. Nothing else is downloaded or sent."
         )
         parent.acknowledgementText = "Built on MONAI-Physio, 3D Slicer and OpenUSD."
         slicer.app.connect("startupCompleted()", register_sample_data)
@@ -109,21 +164,27 @@ class MONAIPhysioRespiratorySimulationLogic(ScriptedLoadableModuleLogic):
         return Path.home() / ".monai_physio" / "network_weights"
 
     @staticmethod
-    def weights_present(weights_dir: Path) -> bool:
+    def weights_present(weights_dir: Path, simulation: str = "respiratory") -> bool:
         return (
-            weights_dir / "physicsnemo_mgn_lung_motion" / "mgn_stage_model.pt"
+            weights_dir / SIMULATIONS[simulation]["weights"] / "mgn_stage_model.pt"
         ).exists()
+
+    @staticmethod
+    def anatomy_color(simulation: str = "respiratory") -> tuple[float, float, float]:
+        """Organ color from Slicer's GenericAnatomyColors table."""
+        spec = SIMULATIONS[simulation]
+        table = slicer.mrmlScene.GetFirstNodeByName("GenericAnatomyColors")
+        if table is not None:
+            index = table.GetColorIndexByName(spec["color_name"])
+            rgba = [0.0, 0.0, 0.0, 0.0]
+            if index >= 0 and table.GetColor(index, rgba):
+                return (rgba[0], rgba[1], rgba[2])
+        return spec["color"]
 
     @staticmethod
     def lung_color() -> tuple[float, float, float]:
         """Lung color from Slicer's GenericAnatomyColors table."""
-        table = slicer.mrmlScene.GetFirstNodeByName("GenericAnatomyColors")
-        if table is not None:
-            index = table.GetColorIndexByName("left_lung")
-            rgba = [0.0, 0.0, 0.0, 0.0]
-            if index >= 0 and table.GetColor(index, rgba):
-                return (rgba[0], rgba[1], rgba[2])
-        return LUNG_COLOR
+        return MONAIPhysioRespiratorySimulationLogic.anatomy_color("respiratory")
 
     @staticmethod
     def write_volume(volume: Any, path: Path) -> None:
@@ -147,18 +208,19 @@ class MONAIPhysioRespiratorySimulationLogic(ScriptedLoadableModuleLogic):
         frames: int = 10,
         cycles_per_minute: float = 12.0,
         usd_name: Optional[str] = None,
+        simulation: str = "respiratory",
+        heart_segmenter: str = "simpleware",
+        simpleware_exe: Optional[str] = None,
     ) -> list[str]:
+        worker_name = SIMULATIONS[simulation]["worker"]
         worker = (
             Path(__file__).resolve().parent.parent / "MONAIPhysioExportUSD"
-            / "MONAIPhysioLib" / "respiratory_simulation_worker.py"
+            / "MONAIPhysioLib" / worker_name
         )
         if not worker.is_file():
             import MONAIPhysioLib
 
-            worker = (
-                Path(MONAIPhysioLib.__file__).resolve().parent
-                / "respiratory_simulation_worker.py"
-            )
+            worker = Path(MONAIPhysioLib.__file__).resolve().parent / worker_name
         if not worker.is_file():
             raise FileNotFoundError(f"Bundled simulation worker is missing: {worker}")
         arguments = [
@@ -175,6 +237,10 @@ class MONAIPhysioRespiratorySimulationLogic(ScriptedLoadableModuleLogic):
         arguments.extend([
             "--frames", str(frames), "--cycles-per-minute", f"{cycles_per_minute:g}",
         ])
+        if simulation == "cardiac":
+            arguments.extend(["--segmenter", heart_segmenter])
+            if heart_segmenter == "simpleware" and simpleware_exe:
+                arguments.extend(["--simpleware-exe", simpleware_exe])
         return arguments
 
     @staticmethod
@@ -195,9 +261,9 @@ class MONAIPhysioRespiratorySimulationLogic(ScriptedLoadableModuleLogic):
         return output / surface_folder, output / ct_folder, output
 
     @staticmethod
-    def usd_file_name(text: str, default_stem: str) -> str:
+    def usd_file_name(text: str, default_stem: str, suffix: str = "respiration") -> str:
         """Validated USD file name; its stem names the root prim /World/<stem>."""
-        name = text.strip() or f"{default_stem}_respiration.usd"
+        name = text.strip() or f"{default_stem}_{suffix}.usd"
         if Path(name).suffix.lower() not in (".usd", ".usda", ".usdc"):
             name += ".usd"
         stem = Path(name).stem
@@ -225,24 +291,26 @@ class MONAIPhysioRespiratorySimulationLogic(ScriptedLoadableModuleLogic):
     def load_results(
         self, result: dict[str, Any],
         color: tuple[float, float, float] = LUNG_COLOR,
+        simulation: str = "respiratory",
     ) -> list[Any]:
         """Build a surface sequence, and a CT sequence if one was written,
         under one browser. Returns the created nodes so a rerun can replace
         them."""
+        spec = SIMULATIONS[simulation]
         scene = slicer.mrmlScene
         stages = result["stages"]
-        surfaces = scene.AddNewNodeByClass("vtkMRMLSequenceNode", "Lung surfaces")
-        surfaces.SetIndexName("respiratory stage")
+        surfaces = scene.AddNewNodeByClass("vtkMRMLSequenceNode", spec["surfaces"])
+        surfaces.SetIndexName(spec["stage"])
         surfaces.SetIndexUnit("")
         for stage, path in zip(stages, result["surfaces"]):
             model = slicer.util.loadModel(path)
             surfaces.SetDataNodeAtValue(model, f"{stage:g}")
             self._discard(model)
         browser = scene.AddNewNodeByClass(
-            "vtkMRMLSequenceBrowserNode", "Respiratory motion"
+            "vtkMRMLSequenceBrowserNode", spec["browser"]
         )
         browser.SetAndObserveMasterSequenceNodeID(surfaces.GetID())
-        # Play back at the simulated breathing rate, cycle after cycle.
+        # Play back at the simulated rate, cycle after cycle.
         if result.get("frames_per_second"):
             browser.SetPlaybackRateFps(float(result["frames_per_second"]))
         browser.SetPlaybackLooped(True)
@@ -251,8 +319,8 @@ class MONAIPhysioRespiratorySimulationLogic(ScriptedLoadableModuleLogic):
             surface_proxy.GetDisplayNode().SetColor(*color)
         created = [browser, surfaces, surface_proxy]
         if result.get("images"):
-            images = scene.AddNewNodeByClass("vtkMRMLSequenceNode", "Lung 4D-CT")
-            images.SetIndexName("respiratory stage")
+            images = scene.AddNewNodeByClass("vtkMRMLSequenceNode", spec["images"])
+            images.SetIndexName(spec["stage"])
             images.SetIndexUnit("")
             for stage, path in zip(stages, result["images"]):
                 volume = slicer.util.loadVolume(path)
@@ -281,20 +349,31 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
         self.work: Optional[tempfile.TemporaryDirectory[str]] = None
         self.vtp_dir: Optional[Path] = None
         self.color = LUNG_COLOR
+        self.run_simulation = "respiratory"
         self.helper.build_header(self.layout, with_models=False)
 
         form = self.helper.section(self.layout, "Input")
+        self.simulation = qt.QComboBox()
+        for key, spec in SIMULATIONS.items():
+            self.simulation.addItem(spec["label"], key)
+        self.simulation.toolTip = (
+            "Respiratory: lung motion over a breathing cycle. Cardiac: heart "
+            "motion over a heartbeat."
+        )
+        self.simulation.currentIndex = max(
+            0, self.simulation.findData(self._setting("simulation", "respiratory"))
+        )
+        form.addRow("Simulation", self.simulation)
         self.volume = slicer.qMRMLNodeComboBox()
         self.volume.nodeTypes = ["vtkMRMLScalarVolumeNode"]
         self.volume.addEnabled = False
         self.volume.removeEnabled = False
         self.volume.noneEnabled = False
         self.volume.toolTip = (
-            "Chest CT, loaded in Slicer, whose lungs are simulated. Its lung "
-            "lobes are segmented with NV-Segment-CTMR, the segmenter the lung "
-            "models were built from; it needs a CUDA GPU, downloads its weights "
-            "once (about 870 MB) and is licensed for non-commercial research "
-            "use only."
+            "Chest CT, loaded in Slicer, whose lungs or heart are simulated. "
+            "NV-Segment-CTMR, used for the lungs and optionally for the heart, "
+            "needs a CUDA GPU, downloads its weights once (about 870 MB) and is "
+            "licensed for non-commercial research use only."
         )
         self.volume.setMRMLScene(slicer.mrmlScene)
         download = qt.QPushButton("Download sample")
@@ -307,25 +386,66 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
         row.addWidget(self.volume, 1)
         row.addWidget(download)
         form.addRow("Chest CT", row)
+
+        self.heart_segmenter = qt.QComboBox()
+        for key, label in HEART_SEGMENTERS:
+            self.heart_segmenter.addItem(label, key)
+        self.heart_segmenter.toolTip = (
+            "The heart shape model and network were built from Simpleware "
+            "Medical ASCardio segmentations, so Simpleware gives the geometry "
+            "they expect (needs a Simpleware Medical installation). "
+            "NV-Segment-CTMR is free for research use and needs a CUDA GPU, "
+            "but its heart labels only approximate ASCardio's and on "
+            "non-contrast CTs it can return the heart as one oversized region."
+        )
+        self.heart_segmenter.currentIndex = max(
+            0, self.heart_segmenter.findData(self._setting("heartSegmenter", "simpleware"))
+        )
+        self.heart_segmenter_label = qt.QLabel("Heart segmenter")
+        form.addRow(self.heart_segmenter_label, self.heart_segmenter)
+        self.simpleware_exe = qt.QLineEdit()
+        self.simpleware_exe.text = self._setting("simplewareExecutable", "")
+        self.simpleware_exe.placeholderText = (
+            "C:/Program Files/Synopsys/Simpleware Medical/Y-2026.03/"
+            "ConsoleSimplewareMedical.exe"
+        )
+        self.simpleware_exe.toolTip = (
+            "ConsoleSimplewareMedical.exe of the Simpleware Medical installation "
+            "(with the ASCardio module). Leave empty for the default path shown."
+        )
+        browse_exe = qt.QToolButton()
+        browse_exe.text = "..."
+        browse_exe.toolTip = "Choose ConsoleSimplewareMedical.exe"
+        browse_exe.clicked.connect(self._choose_simpleware)
+        self.simpleware_row = qt.QWidget()
+        row = qt.QHBoxLayout(self.simpleware_row)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.simpleware_exe)
+        row.addWidget(browse_exe)
+        self.simpleware_label = qt.QLabel("Simpleware executable")
+        self.simpleware_label.indent = 20
+        form.addRow(self.simpleware_label, self.simpleware_row)
+
         self.frames = qt.QSpinBox()
         self.frames.setRange(2, 50)
         self.frames.value = int(self._setting("frames", "10"))
         self.frames.toolTip = (
-            "Respiratory stages simulated over one breathing cycle (at most 50: "
+            "Stages simulated over one breathing or cardiac cycle (at most 50: "
             "MONAI-Physio names stage files in 0.01 steps)"
         )
         form.addRow("Frames per cycle", self.frames)
         self.cycles = qt.QDoubleSpinBox()
-        self.cycles.setRange(1.0, 60.0)
+        self.cycles.setRange(1.0, 240.0)
         self.cycles.decimals = 1
-        self.cycles.value = float(self._setting("cyclesPerMinute", "12"))
-        self.cycles.toolTip = "Breathing rate; sets the USD and sequence playback speed"
-        form.addRow("Cycles per minute", self.cycles)
+        self.cycles.toolTip = (
+            "Breathing or heart rate; sets the USD and sequence playback speed"
+        )
+        self.cycles_label = qt.QLabel()
+        form.addRow(self.cycles_label, self.cycles)
         self.fps_label = qt.QLabel()
         form.addRow("Playback", self.fps_label)
         self.frames.valueChanged.connect(self._update_fps)
         self.cycles.valueChanged.connect(self._update_fps)
-        self._update_fps()
 
         form = self.helper.section(self.layout, "Output")
         self.output = qt.QLineEdit()
@@ -346,7 +466,7 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
         self.surface_folder.text = self._setting("surfaceSubfolder", "VTP")
         self.surface_folder.toolTip = (
             "One folder name, not a path: created inside the output folder for "
-            "the lung surfaces"
+            "the organ surfaces"
         )
         form.addRow("VTK surface subfolder name", self.surface_folder)
         self.usd_enabled = qt.QCheckBox("Write an animated USD file")
@@ -354,7 +474,6 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
         form.addRow(self.usd_enabled)
         self.usd_name = qt.QLineEdit()
         self.usd_name.text = self._setting("usdName", "")
-        self.usd_name.placeholderText = "<CT name>_respiration.usd"
         self.usd_name.toolTip = (
             "File name in the output folder (.usd, .usda or .usdc). Letters, "
             "digits and underscores: it also names the USD root prim."
@@ -364,8 +483,8 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
         self.usd_colors.addItem("Slicer colors", "slicer")
         self.usd_colors.addItem("MONAI-Physio anatomy materials", "anatomy")
         self.usd_colors.toolTip = (
-            "Slicer: the lung color from Slicer's GenericAnatomyColors table. "
-            "Anatomy: MONAI-Physio's lung OmniSurface material."
+            "Slicer: the organ color from Slicer's GenericAnatomyColors table. "
+            "Anatomy: MONAI-Physio's lung or heart OmniSurface material."
         )
         self.usd_colors.currentIndex = max(
             0, self.usd_colors.findData(self._setting("usdColors", "slicer"))
@@ -383,11 +502,15 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
         self._sub_row(form, "4D-CT subfolder name", self.ct_folder, self.ct_enabled)
 
         self.helper.build_footer(self.layout)
-        self.helper.apply_button.toolTip = (
-            "Segment, fit and predict 10 respiratory stages, write the outputs "
-            "and load them as sequences"
-        )
         self.helper.apply_button.clicked.connect(self._run)
+
+        self.shown_simulation = self._simulation()
+        self.cycles.value = self._rate_setting(self.shown_simulation)
+        self.simulation.currentIndexChanged.connect(self._simulation_changed)
+        self.heart_segmenter.currentIndexChanged.connect(self._update_simulation_ui)
+        self.frames.valueChanged.connect(self._update_simulation_ui)
+        self._update_simulation_ui()
+        self._update_fps()
 
     @staticmethod
     def _sub_row(form: Any, label: str, field: Any, checkbox: Any) -> None:
@@ -402,6 +525,45 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
     @staticmethod
     def _setting(key: str, default: str) -> str:
         return str(qt.QSettings().value(SETTINGS + key, default))
+
+    def _simulation(self) -> str:
+        return self.simulation.itemData(self.simulation.currentIndex) or "respiratory"
+
+    def _heart_segmenter(self) -> str:
+        return (
+            self.heart_segmenter.itemData(self.heart_segmenter.currentIndex)
+            or "simpleware"
+        )
+
+    def _rate_setting(self, simulation: str) -> float:
+        spec = SIMULATIONS[simulation]
+        return float(self._setting(spec["rate_setting"], f"{spec['default_rate']:g}"))
+
+    def _simulation_changed(self, *args: Any) -> None:
+        """Keep each simulation's own rate when switching between them."""
+        previous = SIMULATIONS[self.shown_simulation]
+        qt.QSettings().setValue(
+            SETTINGS + previous["rate_setting"], f"{self.cycles.value:g}"
+        )
+        self.shown_simulation = self._simulation()
+        self.cycles.value = self._rate_setting(self.shown_simulation)
+        self._update_simulation_ui()
+
+    def _update_simulation_ui(self, *args: Any) -> None:
+        spec = SIMULATIONS[self._simulation()]
+        cardiac = self._simulation() == "cardiac"
+        for widget in (self.heart_segmenter_label, self.heart_segmenter):
+            widget.visible = cardiac
+        simpleware = cardiac and self._heart_segmenter() == "simpleware"
+        for widget in (self.simpleware_label, self.simpleware_row):
+            widget.visible = simpleware
+        self.cycles_label.text = spec["rate_label"]
+        self.usd_name.placeholderText = f"<CT name>_{spec['usd_suffix']}.usd"
+        self.helper.apply_button.toolTip = (
+            f"Segment, fit and predict {self.frames.value} "
+            f"{spec['stage']}s, write the outputs and load them as sequences"
+        )
+        self._update_fps()
 
     def _download_sample(self) -> None:
         """Download (or reuse the cached) sample chest CT and select it."""
@@ -439,6 +601,15 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
         if path:
             self.output.text = path
 
+    def _choose_simpleware(self) -> None:
+        path = qt.QFileDialog.getOpenFileName(
+            self.parent, "ConsoleSimplewareMedical.exe",
+            self.simpleware_exe.text or self.simpleware_exe.placeholderText,
+            "Executables (*.exe);;All files (*)",
+        )
+        if path:
+            self.simpleware_exe.text = path
+
     def _save_settings(self) -> None:
         settings = qt.QSettings()
         for key, value in (
@@ -446,13 +617,19 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
             ("ctEnabled", self.ct_enabled.checked),
         ):
             settings.setValue(SETTINGS + key, "true" if value else "false")
+        settings.setValue(SETTINGS + "simulation", self._simulation())
+        settings.setValue(SETTINGS + "heartSegmenter", self._heart_segmenter())
+        settings.setValue(SETTINGS + "simplewareExecutable", self.simpleware_exe.text.strip())
         settings.setValue(SETTINGS + "usdColors", self._usd_color_mode())
         settings.setValue(SETTINGS + "outputFolder", self.output.text.strip())
         settings.setValue(SETTINGS + "surfaceSubfolder", self.surface_folder.text.strip())
         settings.setValue(SETTINGS + "ctSubfolder", self.ct_folder.text.strip())
         settings.setValue(SETTINGS + "usdName", self.usd_name.text.strip())
         settings.setValue(SETTINGS + "frames", str(self.frames.value))
-        settings.setValue(SETTINGS + "cyclesPerMinute", f"{self.cycles.value:g}")
+        settings.setValue(
+            SETTINGS + SIMULATIONS[self._simulation()]["rate_setting"],
+            f"{self.cycles.value:g}",
+        )
 
     def _usd_color_mode(self) -> str:
         return self.usd_colors.itemData(self.usd_colors.currentIndex) or "slicer"
@@ -461,11 +638,22 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
         if self.helper.process is not None:
             return
         try:
+            simulation = self._simulation()
+            spec = SIMULATIONS[simulation]
             volume = self.volume.currentNode()
             if volume is None:
                 raise ValueError("Select a chest CT loaded in Slicer.")
             if not self.output.text.strip():
                 raise ValueError("Choose the output folder.")
+            heart_segmenter = self._heart_segmenter()
+            simpleware_exe = self.simpleware_exe.text.strip()
+            if (
+                simulation == "cardiac" and heart_segmenter == "simpleware"
+                and simpleware_exe and not Path(simpleware_exe).is_file()
+            ):
+                raise ValueError(
+                    f"Simpleware Medical executable not found: {simpleware_exe}"
+                )
             vtp_dir, ct_dir, usd_dir = self.logic.output_directories(
                 Path(self.output.text.strip()),
                 self.surface_folder.text.strip(),
@@ -474,15 +662,17 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
             )
             name = re.sub(r"[^A-Za-z0-9_-]+", "_", volume.GetName()).strip("_") or "CT"
             usd_name = (
-                self.logic.usd_file_name(self.usd_name.text, name.replace("-", "_"))
+                self.logic.usd_file_name(
+                    self.usd_name.text, name.replace("-", "_"), spec["usd_suffix"]
+                )
                 if self.usd_enabled.checked else None
             )
             weights_dir = self.logic.weights_directory()
-            if not self.logic.weights_present(weights_dir) and (
+            if not self.logic.weights_present(weights_dir, simulation) and (
                 not slicer.util.confirmOkCancelDisplay(
-                    "The pretrained lung-motion network is downloaded once into "
-                    f"{weights_dir}. Continue?",
-                    windowTitle="MONAI-Physio Respiratory Simulation",
+                    f"The pretrained {spec['network']} network is downloaded "
+                    f"once into {weights_dir}. Continue?",
+                    windowTitle="MONAI-Physio Simulation",
                 )
             ):
                 return
@@ -493,20 +683,22 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
                     "Note: the CT's parent transform is not applied; harden it "
                     "first to simulate in the transformed space."
                 )
-            self.work = tempfile.TemporaryDirectory(prefix="slicer-respiration-")
+            self.work = tempfile.TemporaryDirectory(prefix=f"slicer-{simulation}-")
             image = Path(self.work.name) / "ct.nrrd"
             self.logic.write_volume(volume, image)
-            self.color = self.logic.lung_color()
+            self.color = self.logic.anatomy_color(simulation)
             arguments = self.logic.worker_arguments(
                 image, name, weights_dir, vtp_dir,
                 ct_dir if self.ct_enabled.checked else None,
                 usd_dir if self.usd_enabled.checked else None,
                 self._usd_color_mode(), self.color,
                 self.frames.value, self.cycles.value, usd_name,
+                simulation, heart_segmenter, simpleware_exe or None,
             )
             self.vtp_dir = vtp_dir
+            self.run_simulation = simulation
             self.helper.log.appendPlainText(
-                f"Simulating respiration for '{volume.GetName()}'"
+                f"Simulating {simulation} motion for '{volume.GetName()}'"
             )
             # The shape-model fit downloads registration weights into
             # ./network_weights; run in the cache so they land beside the
@@ -534,7 +726,9 @@ class MONAIPhysioRespiratorySimulationWidget(ScriptedLoadableModuleWidget):
             for node in self.created:
                 if node is not None and slicer.mrmlScene.IsNodePresent(node):
                     slicer.mrmlScene.RemoveNode(node)
-            self.created = self.logic.load_results(result, self.color)
+            self.created = self.logic.load_results(
+                result, self.color, self.run_simulation
+            )
             self.helper.log.appendPlainText(
                 f"Loaded {len(result['surfaces'])} surfaces"
                 + (f" and {len(result['images'])} CT volumes" if result["images"] else "")
@@ -555,6 +749,7 @@ class MONAIPhysioRespiratorySimulationTest(ScriptedLoadableModuleTest):
 
     def runTest(self) -> None:
         self.test_arguments()
+        self.test_cardiac_arguments()
 
     def test_arguments(self) -> None:
         logic = MONAIPhysioRespiratorySimulationLogic
@@ -562,7 +757,7 @@ class MONAIPhysioRespiratorySimulationTest(ScriptedLoadableModuleTest):
             Path("ct.nrrd"), "CT", Path("w"), Path("vtp")
         )
         self.assertTrue(Path(minimal[1]).is_file())
-        for flag in ("--ct-dir", "--usd-dir"):
+        for flag in ("--ct-dir", "--usd-dir", "--segmenter"):
             self.assertNotIn(flag, minimal)
         vtp, ct, usd = logic.output_directories(Path("out"))
         self.assertEqual((vtp, ct, usd), (Path("out/VTP"), Path("out/CT"), Path("out")))
@@ -586,3 +781,26 @@ class MONAIPhysioRespiratorySimulationTest(ScriptedLoadableModuleTest):
         for flag in ("--ct-dir", "--usd-dir", "--usd-colors"):
             self.assertIn(flag, full)
         self.assertEqual(full[full.index("--usd-colors") + 1], "anatomy")
+
+    def test_cardiac_arguments(self) -> None:
+        logic = MONAIPhysioRespiratorySimulationLogic
+        self.assertEqual(
+            logic.usd_file_name("", "Chest_CT", "heartbeat"), "Chest_CT_heartbeat.usd"
+        )
+        simpleware = logic.worker_arguments(
+            Path("ct.nrrd"), "CT", Path("w"), Path("vtp"),
+            simulation="cardiac", simpleware_exe="C:/sw/Console.exe",
+        )
+        self.assertTrue(Path(simpleware[1]).is_file())
+        self.assertEqual(Path(simpleware[1]).name, "cardiac_simulation_worker.py")
+        self.assertEqual(simpleware[simpleware.index("--segmenter") + 1], "simpleware")
+        self.assertEqual(
+            simpleware[simpleware.index("--simpleware-exe") + 1], "C:/sw/Console.exe"
+        )
+        nvsegment = logic.worker_arguments(
+            Path("ct.nrrd"), "CT", Path("w"), Path("vtp"),
+            simulation="cardiac", heart_segmenter="nvsegment",
+            simpleware_exe="C:/sw/Console.exe",
+        )
+        self.assertEqual(nvsegment[nvsegment.index("--segmenter") + 1], "nvsegment")
+        self.assertNotIn("--simpleware-exe", nvsegment)
