@@ -184,6 +184,23 @@ def read_ct(image_file: Path, quiet: bool = False) -> Any:
     return converted
 
 
+def release_memory() -> None:
+    """Return freed Python objects and PyTorch's cached GPU blocks.
+
+    After segmentation the segmenter's network and buffers are no longer
+    needed, but PyTorch keeps its caching allocator's blocks (about 9 GB of
+    process memory for NV-Segment-CTMR on a chest CT) until asked; the fit
+    that follows needs that memory.
+    """
+    import gc
+
+    gc.collect()
+    import torch
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def stale_lung_model_warning(
     model_dir: Path, mean_points: int, pca_model: dict[str, Any]
 ) -> Optional[str]:
@@ -308,6 +325,8 @@ def run(
         extract_group_surfaces=False,
     )
     lobes = lobe_labels(segmentation_method.taxonomy)
+    del segmentation_method
+    release_memory()
     lobe_surfaces = {
         label_name: surface
         for label_name, surface in segmentation_result["label_surfaces"].items()
