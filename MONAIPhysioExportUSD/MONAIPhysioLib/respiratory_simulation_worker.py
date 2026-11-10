@@ -103,6 +103,38 @@ class PhaseProgress:
             progress(percent, message)
 
 
+def read_ct(image_file: Path, quiet: bool = False) -> Any:
+    """Read the CT as signed 16-bit voxels, converting other voxel types.
+
+    MONAI-Physio's ITK filters are wrapped for a few voxel types only: a CT
+    stored as 32-bit int (Slicer's CTChest sample), for example, fails in the
+    first resampling of the segmenter. Values are rounded and clipped to the
+    signed short range, which holds every Hounsfield unit. quiet skips the
+    message, for a second read of a CT already reported.
+    """
+    import itk
+    import numpy as np
+
+    image = itk.imread(str(image_file))
+    array = itk.array_view_from_image(image)
+    if array.dtype == np.int16:
+        return image
+    limits = np.iinfo(np.int16)
+    clipped = int(np.count_nonzero((array < limits.min) | (array > limits.max)))
+    converted = itk.image_from_array(
+        np.clip(np.rint(array), limits.min, limits.max).astype(np.int16)
+    )
+    converted.CopyInformation(image)
+    if quiet:
+        return converted
+    print(
+        f"Converted the CT voxels from {array.dtype} to signed short (int16)"
+        + (f"; {clipped} voxels outside -32768..32767 were clipped." if clipped else "."),
+        flush=True,
+    )
+    return converted
+
+
 def stale_lung_model_warning(
     model_dir: Path, mean_points: int, pca_model: dict[str, Any]
 ) -> Optional[str]:
@@ -210,7 +242,7 @@ def run(
     stale = stale_lung_model_warning(model_dir, pca_mean_surface.n_points, pca_model)
     if stale:
         print(stale, flush=True)
-    patient_image = itk.imread(str(image_file))
+    patient_image = read_ct(image_file)
 
     progress(5, "Segmenting the lung lobes")
     phases = PhaseProgress()

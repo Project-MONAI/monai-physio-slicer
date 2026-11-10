@@ -134,6 +134,45 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
             "PROGRESS 90 USD",
         ])
 
+    def test_read_ct_converts_to_signed_short(self) -> None:
+        import contextlib
+        import io
+
+        import itk
+        import numpy as np
+
+        values = np.array([[[-3024, 0, 3071, 40000]]])
+        with tempfile.TemporaryDirectory() as tmp:
+            for dtype in (np.int32, np.uint16, np.float32, np.int16):
+                source = itk.image_from_array(
+                    np.clip(values, np.iinfo(np.int16).min if dtype != np.uint16 else 0,
+                            np.iinfo(np.int16).max if dtype == np.int16 else None)
+                    .astype(dtype)
+                )
+                source.SetSpacing([0.75, 0.75, 2.5])
+                source.SetOrigin([1.0, 2.0, 3.0])
+                path = Path(tmp) / f"ct_{np.dtype(dtype).name}.nrrd"
+                itk.imwrite(source, str(path))
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    image = worker.read_ct(path)
+                array = itk.array_from_image(image)
+                self.assertEqual(array.dtype, np.int16, dtype)
+                self.assertEqual(tuple(image.GetSpacing()), (0.75, 0.75, 2.5))
+                self.assertEqual(tuple(image.GetOrigin()), (1.0, 2.0, 3.0))
+                quiet = io.StringIO()
+                with contextlib.redirect_stdout(quiet):
+                    worker.read_ct(path, quiet=True)
+                self.assertEqual(quiet.getvalue(), "")
+                if dtype == np.int16:
+                    self.assertEqual(out.getvalue(), "")
+                else:
+                    self.assertIn("Converted the CT voxels", out.getvalue())
+                    self.assertEqual(array[0, 0, 2], 3071)
+                    # 40000 does not fit in a short and is clipped.
+                    self.assertEqual(array[0, 0, 3], 32767)
+                    self.assertIn("1 voxels", out.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()
