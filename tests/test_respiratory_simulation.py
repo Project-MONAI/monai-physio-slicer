@@ -26,14 +26,17 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
             vtp = Path(tmp) / "vtp"
             with patch.object(worker, "run") as run, patch.object(
                 worker, "gpu_status", return_value="cuda test GPU"
-            ):
+            ), patch.object(worker, "fit_in_child_process") as fit:
                 worker.main([
                     "--image", "ct.nrrd", "--weights-dir", tmp, "--vtp-dir", str(vtp),
                 ])
             run.assert_called_once_with(
                 Path("ct.nrrd"), "CT", Path(tmp), vtp, None, None, "slicer",
-                worker.SLICER_LUNG_COLOR, 10, 12.0, None,
+                worker.SLICER_LUNG_COLOR, 10, 12.0, None, phase="predict",
             )
+            # The fit runs first, in a child process given the same arguments.
+            fit.assert_called_once()
+            self.assertEqual(fit.call_args[0][1][:2], ["--image", "ct.nrrd"])
 
     def test_all_outputs_and_stale_result_cleared(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -42,7 +45,7 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
             (vtp / "result.json").write_text("{}")
             with patch.object(worker, "run") as run, patch.object(
                 worker, "gpu_status", return_value="cuda test GPU"
-            ):
+            ), patch.object(worker, "fit_in_child_process") as fit:
                 worker.main([
                     "--image", "ct.nrrd", "--name", "Chest", "--weights-dir", tmp,
                     "--vtp-dir", str(vtp), "--ct-dir", "ct", "--usd-dir", "usd",
@@ -53,7 +56,7 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
             self.assertFalse((vtp / "result.json").exists())
             run.assert_called_once_with(
                 Path("ct.nrrd"), "Chest", Path(tmp), vtp, Path("ct"), Path("usd"),
-                "anatomy", (0.1, 0.2, 0.3), 20, 15.0, "Breathing.usdc",
+                "anatomy", (0.1, 0.2, 0.3), 20, 15.0, "Breathing.usdc", phase="predict",
             )
 
     def test_segmenter_is_nv_segment_ctmr_and_needs_cuda(self) -> None:
@@ -110,7 +113,7 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
             worker.os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             with patch.object(worker, "run"), patch.object(
                 worker, "gpu_status", return_value="unsupported GPU (sm_120)"
-            ):
+            ), patch.object(worker, "fit_in_child_process"):
                 worker.main(["--image", "ct.nrrd", "--weights-dir", tmp,
                              "--vtp-dir", str(Path(tmp) / "vtp")])
             self.assertEqual(worker.os.environ["CUDA_VISIBLE_DEVICES"], "-1")
@@ -133,6 +136,33 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
             "PROGRESS 90 Time series",
             "PROGRESS 90 USD",
         ])
+
+    def test_fit_phase_runs_in_this_process_and_watches_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            vtp = Path(tmp) / "vtp"
+            vtp.mkdir()
+            # The parent's result is left alone by the child.
+            (vtp / "result.json").write_text("{}")
+            with patch.object(worker, "run") as run, patch.object(
+                worker, "gpu_status"
+            ) as gpu, patch.object(worker, "fit_in_child_process") as fit, patch.object(
+                worker, "exit_with_parent"
+            ) as watch:
+                worker.main([
+                    "--image", "ct.nrrd", "--weights-dir", tmp, "--vtp-dir", str(vtp),
+                    "--phase", "fit",
+                ])
+            self.assertTrue((vtp / "result.json").exists())
+        gpu.assert_not_called()
+        fit.assert_not_called()
+        watch.assert_called_once()
+        self.assertEqual(run.call_args.kwargs, {"phase": "fit"})
+
+    def test_child_process_failure_is_reported(self) -> None:
+        with patch("subprocess.call", return_value=3) as call:
+            with self.assertRaisesRegex(RuntimeError, "exit code 3"):
+                worker.fit_in_child_process(Path("w.py"), ["--image", "ct.nrrd"])
+        self.assertEqual(call.call_args[0][0][-4:], ["--image", "ct.nrrd", "--phase", "fit"])
 
     def test_read_ct_converts_to_signed_short(self) -> None:
         import contextlib
@@ -173,7 +203,6 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
                     self.assertEqual(array[0, 0, 3], 32767)
                     self.assertIn("1 voxels", out.getvalue())
 
-
     def test_fit_grid_image_is_cropped_and_isotropic(self) -> None:
         import itk
         import numpy as np
@@ -191,7 +220,6 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
         # The original grid would have been 100 x 100 x 60 voxels at 0.75 mm
         # isotropic: 200 x 200 x 200.
         self.assertLess(int(np.prod(grid.GetLargestPossibleRegion().GetSize())), 30 ** 3)
-
 
     def test_predict_stages_runs_one_stage_per_call(self) -> None:
         import contextlib

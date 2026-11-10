@@ -214,7 +214,8 @@ copy from an earlier release is otherwise kept.
 - **Output**: one **Output folder**, laid out as
   ```
   <output folder>/
-    VTP/   ten predicted lung surfaces, plus the segmented and fitted surfaces
+    VTP/   ten predicted lung surfaces, plus the segmented and fitted surfaces,
+           the shape-model parameters and the lung mask
     CT/    the CT warped to each stage (<name>_s000_ct.mha ... _s090_ct.mha)
     <name>_respiration.usd   the animated USD
   ```

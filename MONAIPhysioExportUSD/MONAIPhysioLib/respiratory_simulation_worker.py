@@ -184,6 +184,55 @@ def read_ct(image_file: Path, quiet: bool = False) -> Any:
     return converted
 
 
+def fit_in_child_process(script: Path, argv: list[str]) -> None:
+    """Run the segmentation and shape-model fit of script in a child process.
+
+    MONAI-Physio's segmentation and registration leave about 15 GB of memory
+    allocated that neither garbage collection nor emptying PyTorch's cache
+    returns; only the end of the process does. Fitting in a child, which
+    writes its results to files and exits, lets the prediction and CT warp
+    start from a clean process. The child's output goes to this process's
+    output, so its progress reaches the Slicer module unchanged.
+    """
+    import subprocess
+
+    sys.stdout.flush()
+    code = subprocess.call(
+        [sys.executable, "-u", str(script), *argv, "--phase", "fit"],
+        stdin=subprocess.DEVNULL,
+    )
+    if code != 0:
+        raise RuntimeError(
+            f"Segmentation and shape-model fit failed (exit code {code}); "
+            "see the messages above."
+        )
+
+
+def exit_with_parent() -> None:
+    """End this process when the process that started it ends.
+
+    Cancel in the Slicer module kills the worker it started, which does not
+    end that worker's own child process: the child watches its parent instead.
+    """
+    import threading
+    import time
+
+    import psutil
+
+    parent = psutil.Process(os.getppid())
+
+    def watch() -> None:
+        while True:
+            try:
+                if not parent.is_running():
+                    os._exit(1)
+            except psutil.Error:
+                os._exit(1)
+            time.sleep(1.0)
+
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def release_memory() -> None:
     """Return freed Python objects and PyTorch's cached GPU blocks.
 
@@ -296,8 +345,16 @@ def run(
     frames: int = DEFAULT_FRAMES,
     cycles_per_minute: float = DEFAULT_CYCLES_PER_MINUTE,
     usd_name: Optional[str] = None,
+    phase: str = "all",
 ) -> dict[str, Any]:
-    """Run the simulation and return the result listing written to result.json."""
+    """Run the simulation and return the result listing written to result.json.
+
+    phase "fit" segments the CT and fits the shape model, writing the shape
+    parameters, the fitted mesh and the organ mask to the VTP folder, and
+    stops; "predict" continues from those files; "all" does both. main runs
+    the fit in a child process: the segmentation and registration leave
+    memory allocated that only the end of the process returns.
+    """
     import itk
     import numpy as np
     import pyvista as pv
@@ -321,94 +378,110 @@ def run(
         if directory is not None:
             directory.mkdir(parents=True, exist_ok=True)
     model_dir = weights_dir / "physicsnemo_mgn_lung_motion"
-    # Fails without a usable GPU, so check before downloading anything.
-    segmentation_method = lung_segmenter(log_level)
-
-    progress(1, "Loading the CT and pretrained network")
-    if not (model_dir / "mgn_stage_model.pt").exists():
-        progress(2, f"Downloading the pretrained network into {weights_dir}")
-        DownloadData.DownloadPhysicsNeMoMGNLungMotionData(weights_dir)
-    pca_model_file = model_dir / "pca_model.json"
-    pca_mean_file = model_dir / "pca_mean_surface.vtp"
-    for required in (model_dir / "mgn_stage_model.pt", pca_model_file, pca_mean_file):
-        if not required.exists():
-            raise FileNotFoundError(f"Missing pretrained network file: {required}")
-    pca_mean_surface = cast(pv.DataSet, pv.read(str(pca_mean_file)))
-    with pca_model_file.open(encoding="utf-8") as f:
-        pca_model = json.load(f)
-    stale = stale_lung_model_warning(model_dir, pca_mean_surface.n_points, pca_model)
-    if stale:
-        print(stale, flush=True)
-    patient_image = read_ct(image_file)
-
-    progress(5, "Segmenting the lung lobes")
-    phases = PhaseProgress()
-    MONAIPhysioBase.set_progress_callback(phases)
-    phases.phase(5, 20)
-    lung_surface_file = vtp_dir / f"{name}_lung_surface.vtp"
-    segmentation_result = WorkflowConvertImageToVTK(
-        segmentation_method=segmentation_method, log_level=log_level
-    ).process(
-        input_image=patient_image,
-        anatomy_groups=[ANATOMY_GROUP],
-        surface_reduction_rate=SURFACE_REDUCTION_RATE,
-        extract_label_surfaces=True,
-        extract_group_surfaces=False,
-    )
-    lobes = lobe_labels(segmentation_method.taxonomy)
-    del segmentation_method
-    release_memory()
-    lobe_surfaces = {
-        label_name: surface
-        for label_name, surface in segmentation_result["label_surfaces"].items()
-        if label_name in lobes.values()
-    }
-    if not lobe_surfaces:
-        raise RuntimeError("NV-Segment-CTMR found no lung lobes in this CT.")
-    print(f"Lung lobes: {', '.join(sorted(lobe_surfaces))}", flush=True)
-    lung_surface = ProcessSurfaceMesh.combine_surfaces(lobe_surfaces)
-    lung_surface.save(str(lung_surface_file))
-    lung_labelmap = segmentation_result["labelmap"]
-    # Binary lobe mask, for the fit's distance map and the warp's exterior
-    # mask. The whole-body labelmap is 0 inside every labelled structure in the
-    # fit's distance map, letting the lung model grow into its neighbours.
-    lung_label_ids = list(lobes)
-    lung_only_mask = itk.image_from_array(
-        np.isin(itk.array_from_image(lung_labelmap), lung_label_ids).astype(np.uint8)
-    )
-    lung_only_mask.CopyInformation(lung_labelmap)
-
-    progress(20, "Fitting the lung shape model")
-    phases.phase(20, 60)
-    fit_image = fit_grid_image(
-        patient_image, itk.array_view_from_image(lung_only_mask) > 0,
-        FIT_MARGIN_MM, FIT_SPACING_MM,
-    )
-    fit_workflow = WorkflowFitStatisticalModelToPatient(
-        template_model=pca_mean_surface,
-        patient_models=[lung_surface],
-        patient_image=fit_image,
-        patient_labelmap=lung_only_mask,
-        log_level=log_level,
-    )
-    fit_workflow.set_use_pca_registration(
-        use_pca_registration=True,
-        pca_model=pca_model,
-        number_of_pca_components=NUMBER_OF_PCA_COMPONENTS,
-        use_surface=False,
-    )
-    fit_workflow.set_icp_transform_type(ICP_TRANSFORM_TYPE)
-    fit_workflow.set_mask_dilation_mm(MASK_DILATION_MM)
-    fit_workflow.set_distancemap_squared_max(DISTANCEMAP_SQUARED_MAX)
-    fit_result = fit_workflow.process()
-    pca_coefficients = fit_workflow.pca_coefficients
-    assert pca_coefficients is not None
     # process_time_series names predicted surfaces after this file's stem.
     pca_coefficients_file = vtp_dir / f"{name}_surface.json"
-    with pca_coefficients_file.open(mode="w", encoding="utf-8") as f:
-        json.dump(pca_coefficients.tolist(), f)
     fitted_reference_mesh_file = vtp_dir / f"{name}_ssm_surface.vtp"
-    fit_result["fitted_reference_mesh"].save(str(fitted_reference_mesh_file))
+    mask_file = vtp_dir / f"{name}_lung_mask.mha"
+    phases = PhaseProgress()
+    MONAIPhysioBase.set_progress_callback(phases)
+    if phase != "predict":
+        # Fails without a usable GPU, so check before downloading anything.
+        segmentation_method = lung_segmenter(log_level)
+
+        progress(1, "Loading the CT and pretrained network")
+        if not (model_dir / "mgn_stage_model.pt").exists():
+            progress(2, f"Downloading the pretrained network into {weights_dir}")
+            DownloadData.DownloadPhysicsNeMoMGNLungMotionData(weights_dir)
+        pca_model_file = model_dir / "pca_model.json"
+        pca_mean_file = model_dir / "pca_mean_surface.vtp"
+        for required in (model_dir / "mgn_stage_model.pt", pca_model_file, pca_mean_file):
+            if not required.exists():
+                raise FileNotFoundError(f"Missing pretrained network file: {required}")
+        pca_mean_surface = cast(pv.DataSet, pv.read(str(pca_mean_file)))
+        with pca_model_file.open(encoding="utf-8") as f:
+            pca_model = json.load(f)
+        stale = stale_lung_model_warning(model_dir, pca_mean_surface.n_points, pca_model)
+        if stale:
+            print(stale, flush=True)
+        patient_image = read_ct(image_file)
+
+        progress(5, "Segmenting the lung lobes")
+        phases.phase(5, 20)
+        lung_surface_file = vtp_dir / f"{name}_lung_surface.vtp"
+        segmentation_result = WorkflowConvertImageToVTK(
+            segmentation_method=segmentation_method, log_level=log_level
+        ).process(
+            input_image=patient_image,
+            anatomy_groups=[ANATOMY_GROUP],
+            surface_reduction_rate=SURFACE_REDUCTION_RATE,
+            extract_label_surfaces=True,
+            extract_group_surfaces=False,
+        )
+        lobes = lobe_labels(segmentation_method.taxonomy)
+        del segmentation_method
+        release_memory()
+        lobe_surfaces = {
+            label_name: surface
+            for label_name, surface in segmentation_result["label_surfaces"].items()
+            if label_name in lobes.values()
+        }
+        if not lobe_surfaces:
+            raise RuntimeError("NV-Segment-CTMR found no lung lobes in this CT.")
+        print(f"Lung lobes: {', '.join(sorted(lobe_surfaces))}", flush=True)
+        lung_surface = ProcessSurfaceMesh.combine_surfaces(lobe_surfaces)
+        lung_surface.save(str(lung_surface_file))
+        lung_labelmap = segmentation_result["labelmap"]
+        # Binary lobe mask, for the fit's distance map and the warp's exterior
+        # mask. The whole-body labelmap is 0 inside every labelled structure in the
+        # fit's distance map, letting the lung model grow into its neighbours.
+        lung_label_ids = list(lobes)
+        lung_only_mask = itk.image_from_array(
+            np.isin(itk.array_from_image(lung_labelmap), lung_label_ids).astype(np.uint8)
+        )
+        lung_only_mask.CopyInformation(lung_labelmap)
+
+        progress(20, "Fitting the lung shape model")
+        phases.phase(20, 60)
+        fit_image = fit_grid_image(
+            patient_image, itk.array_view_from_image(lung_only_mask) > 0,
+            FIT_MARGIN_MM, FIT_SPACING_MM,
+        )
+        fit_workflow = WorkflowFitStatisticalModelToPatient(
+            template_model=pca_mean_surface,
+            patient_models=[lung_surface],
+            patient_image=fit_image,
+            patient_labelmap=lung_only_mask,
+            log_level=log_level,
+        )
+        fit_workflow.set_use_pca_registration(
+            use_pca_registration=True,
+            pca_model=pca_model,
+            number_of_pca_components=NUMBER_OF_PCA_COMPONENTS,
+            use_surface=False,
+        )
+        fit_workflow.set_icp_transform_type(ICP_TRANSFORM_TYPE)
+        fit_workflow.set_mask_dilation_mm(MASK_DILATION_MM)
+        fit_workflow.set_distancemap_squared_max(DISTANCEMAP_SQUARED_MAX)
+        fit_result = fit_workflow.process()
+        pca_coefficients = fit_workflow.pca_coefficients
+        assert pca_coefficients is not None
+        with pca_coefficients_file.open(mode="w", encoding="utf-8") as f:
+            json.dump(pca_coefficients.tolist(), f)
+        fit_result["fitted_reference_mesh"].save(str(fitted_reference_mesh_file))
+        itk.imwrite(lung_only_mask, str(mask_file), compression=True)
+        if phase == "fit":
+            MONAIPhysioBase.set_progress_callback(None)
+            progress(60, "Shape model fitted")
+            return {}
+        del fit_workflow, fit_result, fit_image, segmentation_result, lung_labelmap
+        release_memory()
+    else:
+        for required in (pca_coefficients_file, fitted_reference_mesh_file, mask_file):
+            if not required.exists():
+                raise FileNotFoundError(f"Missing shape-model fit output: {required}")
+        # Only the CT warp needs the CT and the organ mask.
+        patient_image = read_ct(image_file, quiet=True) if ct_dir else None
+        lung_only_mask = itk.imread(str(mask_file)) if ct_dir else None
 
     predict_end = 92 if usd_dir is not None else 98
     progress(
@@ -530,24 +603,37 @@ def main(argv: Optional[list[str]] = None) -> None:
         "--slicer-color", type=float, nargs=3, default=SLICER_LUNG_COLOR,
         metavar=("R", "G", "B"), help="USD solid color in [0, 1] (slicer colors)",
     )
+    # Internal: the step a child process runs (see fit_in_child_process).
+    parser.add_argument("--phase", choices=("fit", "predict", "all"),
+                        help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    gpu = gpu_status()
-    print(f"PyTorch device: {gpu}", flush=True)
-    if gpu.startswith("unsupported"):
-        # Must be set before torch initializes CUDA in this process.
-        os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
-        print(
-            "The installed PyTorch has no kernels for this GPU. Pick a "
-            "matching PyTorch build in the setup menu.",
-            flush=True,
+    if args.phase == "fit":
+        # The parent probed the GPU; CUDA_VISIBLE_DEVICES is inherited.
+        exit_with_parent()
+    else:
+        gpu = gpu_status()
+        print(f"PyTorch device: {gpu}", flush=True)
+        if gpu.startswith("unsupported"):
+            # Must be set before torch initializes CUDA in this process.
+            os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+            print(
+                "The installed PyTorch has no kernels for this GPU. Pick a "
+                "matching PyTorch build in the setup menu.",
+                flush=True,
+            )
+        result_file = args.vtp_dir / "result.json"
+        if result_file.exists():
+            result_file.unlink()
+    phase = args.phase
+    if phase is None:
+        fit_in_child_process(
+            Path(__file__).resolve(), list(sys.argv[1:] if argv is None else argv)
         )
-    result_file = args.vtp_dir / "result.json"
-    if result_file.exists():
-        result_file.unlink()
+        phase = "predict"
     run(
         args.image, args.name, args.weights_dir, args.vtp_dir, args.ct_dir,
         args.usd_dir, args.usd_colors, tuple(args.slicer_color),
-        args.frames, args.cycles_per_minute, args.usd_name,
+        args.frames, args.cycles_per_minute, args.usd_name, phase=phase,
     )
 
 
