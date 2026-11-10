@@ -199,7 +199,9 @@ copy from an earlier release is otherwise kept.
   chest CT used by MONAI-Physio's tutorial 0 (89 MB, checksum-verified and
   cached; also listed in the **Sample Data** module under **Simulation**).
   A parent transform is not applied; harden
-  it first if needed.
+  it first if needed. CTs stored with other voxel types (for example the
+  32-bit integer **CTChest** sample) are converted to signed 16-bit voxels,
+  which MONAI-Physio's image filters require, before the run.
 
   The lungs are always segmented with **NV-Segment-CTMR**, keeping only its
   five lung lobes. The lung shape model and the motion network were built from
@@ -212,7 +214,8 @@ copy from an earlier release is otherwise kept.
 - **Output**: one **Output folder**, laid out as
   ```
   <output folder>/
-    VTP/   ten predicted lung surfaces, plus the segmented and fitted surfaces
+    VTP/   ten predicted lung surfaces, plus the segmented and fitted surfaces,
+           the shape-model parameters and the lung mask
     CT/    the CT warped to each stage (<name>_s000_ct.mha ... _s090_ct.mha)
     <name>_respiration.usd   the animated USD
   ```
