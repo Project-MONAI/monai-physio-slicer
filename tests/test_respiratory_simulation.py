@@ -174,5 +174,24 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
                     self.assertIn("1 voxels", out.getvalue())
 
 
+    def test_fit_grid_image_is_cropped_and_isotropic(self) -> None:
+        import itk
+        import numpy as np
+
+        array = np.zeros((60, 100, 100), np.int16)  # z, y, x at 0.75 x 0.75 x 2.5 mm
+        mask = np.zeros(array.shape, bool)
+        mask[30, 40:60, 40:60] = True
+        image = itk.image_from_array(array)
+        image.SetSpacing([0.75, 0.75, 2.5])
+        grid = worker.fit_grid_image(image, mask, 10.0, 1.5)
+        self.assertEqual(tuple(grid.GetSpacing()), (1.5, 1.5, 1.5))
+        # The mask (15 mm in x and y, one slice in z) plus 10 mm on each side.
+        size = np.array(grid.GetLargestPossibleRegion().GetSize()) * 1.5
+        np.testing.assert_allclose(size, [36.0, 36.0, 25.0], atol=3.0)
+        # The original grid would have been 100 x 100 x 60 voxels at 0.75 mm
+        # isotropic: 200 x 200 x 200.
+        self.assertLess(int(np.prod(grid.GetLargestPossibleRegion().GetSize())), 30 ** 3)
+
+
 if __name__ == "__main__":
     unittest.main()

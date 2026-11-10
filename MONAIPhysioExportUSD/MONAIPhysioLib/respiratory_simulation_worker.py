@@ -69,6 +69,11 @@ MASK_DILATION_MM = 20.0
 DISTANCEMAP_SQUARED_MAX = (1.25 * 20.0) ** 2
 NUMBER_OF_PCA_COMPONENTS = 6
 SMOOTHING_SIGMA_MM = 10.0
+# Margin kept around the lungs when cropping the CT for the shape-model fit,
+# beyond the 25 mm at which its distance maps saturate, and the isotropic
+# pitch the fit registers on (see fit_grid_image).
+FIT_MARGIN_MM = 40.0
+FIT_SPACING_MM = 1.5
 
 # Points in pca_mean_surface.vtp of the lung model MONAI-Physio downloads now.
 # DownloadData skips the download once mgn_stage_model.pt exists, so an older
@@ -101,6 +106,50 @@ class PhaseProgress:
         if percent != self.last:
             self.last = percent
             progress(percent, message)
+
+
+def crop_to_mask(images: list[Any], mask_array: Any, margin_mm: float) -> list[Any]:
+    """Crop images sharing one grid to the mask's bounding box plus a margin.
+
+    The shape-model fit resamples its image to isotropic voxels, pads it and
+    registers distance maps on that grid: for a whole chest CT, hundreds of
+    millions of voxels and tens of GB of memory, while the organ and its
+    surroundings fit in a fraction of it. The distance maps saturate within
+    a few centimeters of the organ surface, so a wider margin adds nothing to
+    the fit. Physical coordinates are kept, so the fitted mesh is unaffected.
+    """
+    import itk
+    import numpy as np
+
+    spacing = np.array(images[0].GetSpacing())  # x, y, z
+    size = np.array(images[0].GetLargestPossibleRegion().GetSize())
+    nonzero = np.argwhere(mask_array)  # z, y, x
+    margin = np.ceil(margin_mm / spacing).astype(int)
+    lower = np.maximum(nonzero.min(axis=0)[::-1] - margin, 0)
+    upper = np.minimum(nonzero.max(axis=0)[::-1] + margin + 1, size)
+    region = itk.ImageRegion[3]()
+    region.SetIndex([int(v) for v in lower])
+    region.SetSize([int(v) for v in upper - lower])
+    return [
+        itk.region_of_interest_image_filter(image, region_of_interest=region)
+        for image in images
+    ]
+
+
+def fit_grid_image(image: Any, mask_array: Any, margin_mm: float, spacing_mm: float) -> Any:
+    """The CT cropped around the organ and resampled to isotropic spacing_mm.
+
+    WorkflowFitStatisticalModelToPatient registers on its image's grid,
+    resampling a non-isotropic image to the CT's finest pitch: for a chest CT
+    (0.7-0.8 mm) that is 100-250 million voxels once padded, and its
+    distance-map registration then needs tens of GB of memory. An isotropic
+    image is used as given, so a coarser grid here bounds that memory; the
+    fit's distance maps vary smoothly and Greedy downsamples them anyway.
+    """
+    from monai_physio import ProcessImages
+
+    (cropped,) = crop_to_mask([image], mask_array, margin_mm)
+    return ProcessImages().make_isotropic_image(cropped, spacing_mm)
 
 
 def read_ct(image_file: Path, quiet: bool = False) -> Any:
@@ -281,10 +330,14 @@ def run(
 
     progress(20, "Fitting the lung shape model")
     phases.phase(20, 60)
+    fit_image = fit_grid_image(
+        patient_image, itk.array_view_from_image(lung_only_mask) > 0,
+        FIT_MARGIN_MM, FIT_SPACING_MM,
+    )
     fit_workflow = WorkflowFitStatisticalModelToPatient(
         template_model=pca_mean_surface,
         patient_models=[lung_surface],
-        patient_image=patient_image,
+        patient_image=fit_image,
         patient_labelmap=lung_only_mask,
         log_level=log_level,
     )
