@@ -201,6 +201,37 @@ def release_memory() -> None:
         torch.cuda.empty_cache()
 
 
+def predict_stages(
+    infer_movement: Any,
+    stages: list[float],
+    phases: PhaseProgress,
+    start: float,
+    end: float,
+    **arguments: Any,
+) -> dict[str, list[Any]]:
+    """Run WorkflowInferMovement.process_time_series one stage at a time.
+
+    process_time_series keeps every stage's full-resolution displacement
+    field (about 1 GB per stage for a 512x512 chest CT) in its result until
+    it returns, which a long series cannot afford. One stage per call frees
+    each field before the next is built; the outputs are the same.
+    """
+    import gc
+
+    combined: dict[str, list[Any]] = {
+        "predicted_surfaces": [], "warped_images": [], "stage_meshes": [],
+    }
+    share = (end - start) / len(stages)
+    for index, stage in enumerate(stages):
+        phases.phase(start + index * share, start + (index + 1) * share)
+        result = infer_movement.process_time_series(stages=[stage], **arguments)
+        for key in combined:
+            combined[key].extend(result[key])
+        del result
+        gc.collect()
+    return combined
+
+
 def stale_lung_model_warning(
     model_dir: Path, mean_points: int, pca_model: dict[str, Any]
 ) -> Optional[str]:
@@ -387,12 +418,10 @@ def run(
     infer_workflow = WorkflowInferPhysicsNeMo(
         model_directory=model_dir, epoch=None, log_level=log_level
     )
-    phases.phase(60, predict_end)
-    infer_result = WorkflowInferMovement(
-        infer_workflow, log_level=log_level
-    ).process_time_series(
+    infer_result = predict_stages(
+        WorkflowInferMovement(infer_workflow, log_level=log_level),
+        stages, phases, 60, predict_end,
         shape_parameters=pca_coefficients_file,
-        stages=stages,
         output_directory=vtp_dir,
         fitted_reference_mesh=fitted_reference_mesh_file,
         reference_image=patient_image if ct_dir else None,

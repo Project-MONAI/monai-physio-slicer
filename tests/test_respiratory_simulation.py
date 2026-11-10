@@ -193,5 +193,33 @@ class RespiratorySimulationWorkerTests(unittest.TestCase):
         self.assertLess(int(np.prod(grid.GetLargestPossibleRegion().GetSize())), 30 ** 3)
 
 
+    def test_predict_stages_runs_one_stage_per_call(self) -> None:
+        import contextlib
+        import io
+
+        calls = []
+
+        class Infer:
+            def process_time_series(self, stages, **arguments):
+                calls.append((stages, arguments))
+                tag = f"s{int(stages[0] * 100):03d}"
+                return {
+                    "predicted_surfaces": [f"{tag}.vtp"], "warped_images": [f"{tag}.mha"],
+                    "stage_meshes": [tag], "transforms": ["large field"],
+                }
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            result = worker.predict_stages(
+                Infer(), [0.0, 0.5], worker.PhaseProgress(), 60, 90, output_directory="o"
+            )
+        self.assertEqual(calls, [([0.0], {"output_directory": "o"}),
+                                 ([0.5], {"output_directory": "o"})])
+        self.assertEqual(result, {
+            "predicted_surfaces": ["s000.vtp", "s050.vtp"],
+            "warped_images": ["s000.mha", "s050.mha"],
+            "stage_meshes": ["s000", "s050"],
+        })
+
+
 if __name__ == "__main__":
     unittest.main()
