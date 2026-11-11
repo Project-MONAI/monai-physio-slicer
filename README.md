@@ -8,9 +8,10 @@ modules, both in Slicer's **Simulation** category:
 - **MONAI Physio USD Export** writes Slicer surface models, or tetrahedral or
   hexahedral volume meshes made from them, to an OpenUSD file, keeping
   geometry, placement and appearance, and can rewrite it as the scene changes.
-- **MONAI-Physio Respiratory Simulation** predicts one breathing cycle of lung
-  motion from a chest CT and loads the moving lung surfaces and the warped
-  4D-CT as Slicer sequences, with an animated USD for Omniverse.
+- **MONAI-Physio Respiratory and Cardiac Simulation** predicts one breathing
+  cycle of lung motion, or one heartbeat of heart motion, from a chest CT and
+  loads the moving surfaces and the warped 4D-CT as Slicer sequences, with an
+  animated USD for Omniverse.
 
 ![USD export of the sample models](docs/images/export-usd.png)
 
@@ -27,11 +28,12 @@ non-commercial research license (see below).
 
 ## Requirements
 
-| | USD Export: surface, hexahedra | USD Export: tetrahedra | Respiratory Simulation |
+| | USD Export: surface, hexahedra | USD Export: tetrahedra | Respiratory and Cardiac Simulation |
 | --- | --- | --- | --- |
 | Slicer | 5.10 or newer (Python 3.12) | same | same |
 | PyTorch | installed by setup (CPU build is enough) | CUDA build | CUDA build |
 | GPU | not needed | CUDA GPU | CUDA GPU with 16 GB or more (about 15 GB used in [validation](docs/VALIDATION.md)) |
+| System memory | | | about 40 GB free, RAM plus page file, for a 512x512 chest CT (respiratory peak 37 GB, cardiac 24 GB) |
 | Disk | several GB for the Python packages | same | plus about 1.4 GB of network weights |
 
 PyTorch is always installed, because MONAI-Physio depends on it (and on
@@ -52,6 +54,7 @@ Downloads happen only on these actions:
 | **Set up MONAI-Physio in Slicer...** (asks first) | PyTorch and torchvision, torch-scatter, MONAI-Physio and its dependencies: several GB | download.pytorch.org; data.pyg.org or this repository's [`Data` release](https://github.com/Project-MONAI/monai-physio-slicer/releases/tag/Data); PyPI |
 | First **Apply** in Respiratory Simulation (asks first) | Pretrained lung-motion and registration networks, about 0.5 GB, into `~/.monai_physio/network_weights` | MONAI-Physio's model locations |
 | same | NV-Segment-CTMR weights, about 870 MB, into the Hugging Face cache | Hugging Face |
+| First cardiac **Apply** (asks first) | Pretrained Duke heart-motion network and heart shape model into `~/.monai_physio/network_weights` | MONAI-Physio's GitHub release |
 | **Download sample models** / **Download sample** | Sample model scene (80 MB) / chest CT (89 MB), cached | this repository's `Data` release |
 
 The first setup and the first respiratory simulation are therefore much
@@ -70,7 +73,7 @@ Slicer. To run from source instead:
 Then:
 
 1. Open **Simulation > MONAI Physio USD Export** or
-   **Simulation > MONAI-Physio Respiratory Simulation**.
+   **Simulation > MONAI-Physio Respiratory and Cardiac Simulation**.
 2. Pick a build in the **PyTorch** menu if needed (see Requirements) and click
    **Set up MONAI-Physio in Slicer...**. Setup uses Slicer's Python package
    manager and asks for confirmation before installing. Restart Slicer if
@@ -180,7 +183,8 @@ limited to 30 million voxels.
 
 ## Respiratory simulation
 
-**MONAI-Physio Respiratory Simulation** follows
+**MONAI-Physio Respiratory and Cardiac Simulation**, with **Simulation** set
+to **Respiratory (lungs)**, follows
 [tutorial 0](https://github.com/Project-MONAI/monai-physio/blob/main/tutorials/tutorial_00_infer_respiratory_motion_tcia_lung_3d_ct.ipynb)
 of MONAI-Physio on a chest CT already loaded in Slicer: it segments the lung
 lobes, fits the lung PCA shape model, and predicts one respiratory cycle (10 stages, 0.0-0.9, by default)
@@ -227,13 +231,44 @@ copy from an earlier release is otherwise kept.
   skips the warping, the slowest and most memory-hungry part.
 
 **Frames per cycle** (2-50, default 10) sets how many stages are simulated, and
-**Cycles per minute** (default 12) the breathing rate: the USD and the sequence
+**Breaths per minute** (default 12) the breathing rate: the USD and the sequence
 browser play at frames x cycles / 60 frames per second (2 fps by default, one
 cycle every 5 s), looping. One sequence browser, **Respiratory motion**, drives
 both sequences. The run needs a CUDA GPU that the installed PyTorch supports.
 If the build does not support the GPU (for example a CUDA 12.6 build on an
 RTX 50 / Blackwell card), the log says so and the run stops before it starts;
 choose a matching build in the **PyTorch** menu above the setup button.
+
+## Cardiac simulation
+
+With **Simulation** set to **Cardiac (heart)**, the same module follows MONAI-Physio's
+[cardiac tutorial 0](https://github.com/Project-MONAI/monai-physio/blob/main/tutorials/tutorial_00_infer_cardiac_motion_duke_heart_4d_labelmaps.ipynb),
+segmenting the heart of the selected chest CT the way
+[tutorial 13](https://github.com/Project-MONAI/monai-physio/blob/main/tutorials/tutorial_13_combine_heart_and_lung_motion_chest_3d_ct.py)
+does: it fits the Duke heart PCA shape model (the heart wall, without the
+chamber cavities and great vessels) and predicts one heartbeat with the
+pretrained Duke heart-motion MeshGraphNet. The 4D-CT is warped with the heart's
+motion confined to its surroundings (sliding at the pericardium, fading out
+within a few millimeters).
+
+**Heart segmenter** chooses how the heart is segmented:
+
+- **Simpleware Medical ASCardio**: the segmenter the heart shape model and
+  network were built from, so it gives the geometry they expect. It needs a
+  separate, commercial Synopsys Simpleware Medical installation; set
+  **Simpleware executable** to its `ConsoleSimplewareMedical.exe` (empty uses
+  MONAI-Physio's default path).
+- **NV-Segment-CTMR**: free for non-commercial research and needs a CUDA GPU.
+  Its heart labels are mapped onto the ASCardio ones, which only approximates
+  them. On non-contrast CTs, including the sample chest CT, it returns the
+  heart without separate ventricles, so the fitted heart includes their
+  cavities and the predicted motion is unreliable; the log warns when that
+  happens.
+
+Results load as the **Heart surfaces** and **Heart 4D-CT** sequences under the
+**Cardiac motion** browser, and the USD is `<name>_heartbeat.usd` (**MONAI-Physio
+anatomy materials** use the heart OmniSurface material). **Beats per minute**
+(default 60) sets the playback rate; each simulation keeps its own rate.
 
 ## What is preserved
 

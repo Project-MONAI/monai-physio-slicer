@@ -9,6 +9,7 @@ set(MODULE_PYTHON_SCRIPTS
   MONAIPhysioLib/snapshot.py
   MONAIPhysioLib/export_worker.py
   MONAIPhysioLib/respiratory_simulation_worker.py
+  MONAIPhysioLib/cardiac_simulation_worker.py
   MONAIPhysioLib/runtime.py
   )
 
